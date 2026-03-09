@@ -47,6 +47,18 @@ var (
 		Name: "trackalph_bot_notifications_consumed_total",
 		Help: "Total notification messages consumed by bot service.",
 	})
+	botNotificationsSentTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "trackalph_bot_notifications_sent_total",
+		Help: "Total Telegram notifications successfully sent.",
+	})
+	botNotificationErrorsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "trackalph_bot_notification_errors_total",
+		Help: "Total Telegram notification send errors.",
+	})
+	addressesTrackedGauge = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "trackalph_addresses_tracked",
+		Help: "Current number of unique tracked addresses.",
+	})
 	botMessagesSentTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "trackalph_bot_messages_sent_total",
 		Help: "Total Telegram messages send attempts by status.",
@@ -94,6 +106,12 @@ func main() {
 	go func() {
 		defer wg.Done()
 		handleUpdates(appCtx, bot, st)
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		reportAddressMetrics(appCtx, st)
 	}()
 
 	wg.Add(1)
@@ -445,6 +463,34 @@ func sendMessage(bot *tgbotapi.BotAPI, chatID int64, text string) {
 	}
 }
 
+func sendNotificationMessage(bot *tgbotapi.BotAPI, chatID int64, text string) {
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ParseMode = tgbotapi.ModeHTML
+	msg.DisableWebPagePreview = true
+	if _, err := bot.Send(msg); err != nil {
+		botMessagesSentTotal.WithLabelValues("error").Inc()
+		botNotificationErrorsTotal.Inc()
+		log.Printf("Error sending notification to %d: %v", chatID, err)
+	} else {
+		botMessagesSentTotal.WithLabelValues("ok").Inc()
+		botNotificationsSentTotal.Inc()
+	}
+}
+
+func reportAddressMetrics(ctx context.Context, st *store.Store) {
+	t := time.NewTicker(15 * time.Second)
+	defer t.Stop()
+
+	for {
+		addressesTrackedGauge.Set(float64(st.CountWatchedAddresses(ctx)))
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+}
+
 func editMessageText(bot *tgbotapi.BotAPI, chatID int64, messageID int, text string) {
 	edit := tgbotapi.NewEditMessageText(chatID, messageID, text)
 	edit.ParseMode = tgbotapi.ModeHTML
@@ -501,7 +547,7 @@ func consumeNotifications(ctx context.Context, bot *tgbotapi.BotAPI, str *stream
 			}
 
 			if notif.Channel == models.ChannelTelegram {
-				sendMessage(bot, notif.ChatID, notif.Message)
+				sendNotificationMessage(bot, notif.ChatID, notif.Message)
 			}
 			str.Ack(ctx, stream.NotificationsStream, groupName, msg.ID)
 		}

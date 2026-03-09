@@ -156,6 +156,15 @@ func (s *Store) IsWatched(ctx context.Context, address string) bool {
 	return ok
 }
 
+// CountWatchedAddresses returns how many unique addresses are tracked.
+func (s *Store) CountWatchedAddresses(ctx context.Context) int64 {
+	n, err := s.rdb.SCard(ctx, keyWatched).Result()
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
 // GetSubscribersForAddress returns all subscribers (Telegram + webhook) for an address.
 func (s *Store) GetSubscribersForAddress(ctx context.Context, address string) []Subscriber {
 	entries, _ := s.rdb.HGetAll(ctx, keyAddrPrefix+address).Result()
