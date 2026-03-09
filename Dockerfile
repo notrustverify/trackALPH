@@ -2,7 +2,11 @@ FROM golang:1.25-alpine AS builder
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
-COPY . .
+COPY cmd ./cmd
+COPY internal ./internal
+
+# Fail early with a clear error if the build context is wrong.
+RUN test -d ./cmd/scraper && test -d ./cmd/matcher && test -d ./cmd/bot
 
 FROM builder AS build-scraper
 RUN CGO_ENABLED=0 go build -o /scraper ./cmd/scraper
