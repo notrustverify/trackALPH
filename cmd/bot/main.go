@@ -586,7 +586,9 @@ To change a filter, just re-register with the same address.`
 }
 
 func isValidAlephiumAddress(addr string) bool {
-	if len(addr) < 40 || len(addr) > 50 {
+	// Keep lightweight validation to avoid rejecting future or uncommon
+	// address/script formats while still catching obvious mistakes.
+	if len(addr) < 40 || len(addr) > 2048 {
 		return false
 	}
 
