@@ -2,19 +2,22 @@ FROM golang:1.25-alpine AS builder
 WORKDIR /app
 COPY . .
 
-# Support both context layouts:
-# 1) project root context (cmd/, internal/, go.mod at /app)
-# 2) parent folder context where project is in /app/trackalph
+# Discover project root anywhere under /app (up to 3 levels deep),
+# requiring go.mod + cmd + internal.
 RUN set -eux; \
-	if [ -f /app/go.mod ] && [ -d /app/cmd ] && [ -d /app/internal ]; then \
-		ln -s /app /src; \
-	elif [ -f /app/trackalph/go.mod ] && [ -d /app/trackalph/cmd ] && [ -d /app/trackalph/internal ]; then \
-		ln -s /app/trackalph /src; \
-	else \
+	src=""; \
+	for d in /app /app/* /app/*/* /app/*/*/*; do \
+		if [ -d "$d" ] && [ -f "$d/go.mod" ] && [ -d "$d/cmd" ] && [ -d "$d/internal" ]; then \
+			src="$d"; \
+			break; \
+		fi; \
+	done; \
+	if [ -z "$src" ]; then \
 		echo "Could not locate project root with go.mod + cmd + internal"; \
 		ls -la /app; \
 		exit 1; \
-	fi
+	fi; \
+	ln -s "$src" /src
 
 RUN go -C /src mod download
 
