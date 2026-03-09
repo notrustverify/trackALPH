@@ -200,9 +200,9 @@ func handleWatch(bot *tgbotapi.BotAPI, chatID int64, args string) {
 
 	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("↕️ All", callbackWatch+store.FilterAll+":"+address),
-			tgbotapi.NewInlineKeyboardButtonData("📥 Incoming", callbackWatch+store.FilterIn+":"+address),
-			tgbotapi.NewInlineKeyboardButtonData("📤 Outgoing", callbackWatch+store.FilterOut+":"+address),
+			tgbotapi.NewInlineKeyboardButtonData("↕️ All", callbackWatch+store.FilterAll),
+			tgbotapi.NewInlineKeyboardButtonData("📥 Incoming", callbackWatch+store.FilterIn),
+			tgbotapi.NewInlineKeyboardButtonData("📤 Outgoing", callbackWatch+store.FilterOut),
 		),
 	)
 
@@ -321,20 +321,18 @@ func handleCallback(ctx context.Context, bot *tgbotapi.BotAPI, st *store.Store, 
 	data := cb.Data
 	switch {
 	case strings.HasPrefix(data, callbackWatch):
-		handleWatchCallback(ctx, bot, st, chatID, cb.Message.MessageID, strings.TrimPrefix(data, callbackWatch))
+		handleWatchCallback(ctx, bot, st, chatID, cb.Message.MessageID, strings.TrimPrefix(data, callbackWatch), cb.Message.Text)
 	case strings.HasPrefix(data, callbackWebhook):
 		handleWebhookCallback(ctx, bot, st, chatID, cb.Message.MessageID, strings.TrimPrefix(data, callbackWebhook))
 	}
 }
 
-func handleWatchCallback(ctx context.Context, bot *tgbotapi.BotAPI, st *store.Store, chatID int64, msgID int, data string) {
-	// Format: "<filter>:<address>"
-	parts := strings.SplitN(data, ":", 2)
-	if len(parts) != 2 {
+func handleWatchCallback(ctx context.Context, bot *tgbotapi.BotAPI, st *store.Store, chatID int64, msgID int, filter string, sourceText string) {
+	address := extractAddressFromPrompt(sourceText)
+	if address == "" {
+		editMessageText(bot, chatID, msgID, "Could not read address from selection message. Please run /watch again.")
 		return
 	}
-
-	filter, address := parts[0], parts[1]
 	if filter != store.FilterAll && filter != store.FilterIn && filter != store.FilterOut {
 		return
 	}
@@ -347,6 +345,16 @@ func handleWatchCallback(ctx context.Context, bot *tgbotapi.BotAPI, st *store.St
 
 	editMessageText(bot, chatID, msgID,
 		fmt.Sprintf("✅ Now watching address:\n<code>%s</code>\nFilter: <b>%s</b>", address, filterLabel(filter)))
+}
+
+func extractAddressFromPrompt(text string) string {
+	// Prompt format:
+	// "Choose notification filter for:\n<address>"
+	lines := strings.Split(strings.TrimSpace(text), "\n")
+	if len(lines) < 2 {
+		return ""
+	}
+	return strings.TrimSpace(lines[len(lines)-1])
 }
 
 func handleWebhookCallback(ctx context.Context, bot *tgbotapi.BotAPI, st *store.Store, chatID int64, msgID int, data string) {
