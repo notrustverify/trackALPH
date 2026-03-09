@@ -1,0 +1,7 @@
+scraper
+matcher
+bot
+webhook
+*.db
+.env
+data/
