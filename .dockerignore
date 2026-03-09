@@ -1,0 +1,11 @@
+.git
+.gitignore
+.env
+data/
+scraper
+matcher
+bot
+webhook
+trackalph
+README.md
+observability/
