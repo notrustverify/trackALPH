@@ -344,7 +344,7 @@ func handleWatchCallback(ctx context.Context, bot *tgbotapi.BotAPI, st *store.St
 	}
 
 	editMessageText(bot, chatID, msgID,
-		fmt.Sprintf("✅ Now watching address:\n<code>%s</code>\nFilter: <b>%s</b>", address, filterLabel(filter)))
+		fmt.Sprintf("✅ Now watching address:\n<code>%s</code>\nFilter: <b>%s</b>", maskAddress(address), filterLabel(filter)))
 }
 
 func extractAddressFromPrompt(text string) string {
@@ -355,6 +355,13 @@ func extractAddressFromPrompt(text string) string {
 		return ""
 	}
 	return strings.TrimSpace(lines[len(lines)-1])
+}
+
+func maskAddress(addr string) string {
+	if len(addr) <= 10 {
+		return addr
+	}
+	return addr[:5] + "..." + addr[len(addr)-5:]
 }
 
 func handleWebhookCallback(ctx context.Context, bot *tgbotapi.BotAPI, st *store.Store, chatID int64, msgID int, data string) {
