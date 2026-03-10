@@ -62,6 +62,18 @@ var (
 		Name: "trackalph_addresses_tracked",
 		Help: "Current number of unique tracked addresses.",
 	})
+	addressesTrackedTotalGauge = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "trackalph_addresses_tracked_total",
+		Help: "Current number of unique tracked addresses (all channels).",
+	})
+	addressesTrackedTelegramGauge = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "trackalph_addresses_tracked_telegram",
+		Help: "Current number of unique addresses tracked by at least one Telegram subscriber.",
+	})
+	addressesTrackedWebhookGauge = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "trackalph_addresses_tracked_webhook",
+		Help: "Current number of unique addresses tracked by at least one webhook subscriber.",
+	})
 	botMessagesSentTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "trackalph_bot_messages_sent_total",
 		Help: "Total Telegram messages send attempts by status.",
@@ -582,7 +594,11 @@ func reportAddressMetrics(ctx context.Context, st *store.Store) {
 	defer t.Stop()
 
 	for {
-		addressesTrackedGauge.Set(float64(st.CountWatchedAddresses(ctx)))
+		total, telegram, webhook := st.CountWatchedAddressesByChannel(ctx)
+		addressesTrackedGauge.Set(float64(total))
+		addressesTrackedTotalGauge.Set(float64(total))
+		addressesTrackedTelegramGauge.Set(float64(telegram))
+		addressesTrackedWebhookGauge.Set(float64(webhook))
 		select {
 		case <-ctx.Done():
 			return

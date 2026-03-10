@@ -112,22 +112,54 @@ const (
 )
 
 type Notification struct {
-	Channel string `json:"channel"`
-	ChatID  int64  `json:"chat_id,omitempty"`
-	URL     string `json:"url,omitempty"`
-	Message string `json:"message"`
+	Channel      string  `json:"channel"`
+	ChatID       int64   `json:"chat_id,omitempty"`
+	URL          string  `json:"url,omitempty"`
+	Message      string  `json:"message"`
+	Event        string  `json:"event,omitempty"`
+	ActionType   string  `json:"action_type,omitempty"`
+	ActionAmount float64 `json:"action_amount,omitempty"`
+	ActionToken  string  `json:"action_token,omitempty"`
+	GasAmount    float64 `json:"gas_amount,omitempty"`
+	GasToken     string  `json:"gas_token,omitempty"`
+	Address      string  `json:"address,omitempty"`
+	Contract     string  `json:"contract,omitempty"`
+	ChainFrom    int     `json:"chainfrom,omitempty"`
+	ChainTo      int     `json:"chainto,omitempty"`
+	ExplorerURL  string  `json:"explorer_url,omitempty"`
 }
 
 // WebhookEvent is the JSON envelope POSTed to user webhook URLs.
 type WebhookEvent struct {
-	Type      string          `json:"type"`
-	Timestamp string          `json:"timestamp"`
+	ID          string           `json:"id"`
+	Type        string           `json:"type"`
+	SpecVersion string           `json:"specversion"`
+	Timestamp   string           `json:"timestamp"`
 	Data      WebhookEventData `json:"data"`
 }
 
+type WebhookAction struct {
+	Type   string  `json:"type,omitempty"`
+	Amount float64 `json:"amount,omitempty"`
+	Token  string  `json:"token,omitempty"`
+}
+
+type WebhookGas struct {
+	Amount float64 `json:"amount,omitempty"`
+	Token  string  `json:"token,omitempty"`
+}
+
 type WebhookEventData struct {
-	Message string `json:"message"`
-	Channel string `json:"channel,omitempty"`
+	Event       string        `json:"event,omitempty"`
+	Action      WebhookAction `json:"action,omitempty"`
+	Gas         WebhookGas    `json:"gas,omitempty"`
+	Address     string        `json:"address,omitempty"`
+	Contract    string        `json:"contract,omitempty"`
+	ChainFrom   int           `json:"chainfrom,omitempty"`
+	ChainTo     int           `json:"chainto,omitempty"`
+	ExplorerURL string        `json:"explorer_url,omitempty"`
+	MessageHTML string        `json:"message_html,omitempty"`
+	Channel     string        `json:"channel,omitempty"`
 }
 
 // Constants

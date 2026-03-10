@@ -183,6 +183,50 @@ func (s *Store) CountWatchedAddresses(ctx context.Context) int64 {
 	return n
 }
 
+// CountWatchedAddressesByChannel returns unique address counts split by subscriber channel.
+// An address can be counted in both telegram and webhook buckets if it has both.
+func (s *Store) CountWatchedAddressesByChannel(ctx context.Context) (total, telegram, webhook int64) {
+	total = s.CountWatchedAddresses(ctx)
+
+	var cursor uint64
+	for {
+		keys, next, err := s.rdb.Scan(ctx, cursor, keyAddrPrefix+"*", 200).Result()
+		if err != nil {
+			return total, telegram, webhook
+		}
+		for _, key := range keys {
+			fields, err := s.rdb.HKeys(ctx, key).Result()
+			if err != nil {
+				continue
+			}
+			hasTelegram := false
+			hasWebhook := false
+			for _, f := range fields {
+				if strings.HasPrefix(f, telegramFieldPrefix) {
+					hasTelegram = true
+				} else if strings.HasPrefix(f, webhookFieldPrefix) {
+					hasWebhook = true
+				}
+				if hasTelegram && hasWebhook {
+					break
+				}
+			}
+			if hasTelegram {
+				telegram++
+			}
+			if hasWebhook {
+				webhook++
+			}
+		}
+		cursor = next
+		if cursor == 0 {
+			break
+		}
+	}
+
+	return total, telegram, webhook
+}
+
 // GetSubscribersForAddress returns all subscribers (Telegram + webhook) for an address.
 func (s *Store) GetSubscribersForAddress(ctx context.Context, address string) []Subscriber {
 	entries, _ := s.rdb.HGetAll(ctx, keyAddrPrefix+address).Result()

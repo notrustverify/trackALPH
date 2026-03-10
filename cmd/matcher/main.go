@@ -344,11 +344,28 @@ func (m *matcher) processTx(ctx context.Context, ref models.TxRef) {
 				}
 			}
 
+			event, actionType, actionAmount, actionToken := deriveWebhookAction(flow, isSender, isContract)
+			contractAddr := ""
+			if len(flow.contractAddrs) > 0 {
+				contractAddr = flow.contractAddrs[0]
+			}
+
 			notif := models.Notification{
-				Channel: sub.Channel,
-				ChatID:  sub.ChatID,
-				URL:     sub.URL,
-				Message: msgOut,
+				Channel:      sub.Channel,
+				ChatID:       sub.ChatID,
+				URL:          sub.URL,
+				Message:      msgOut,
+				Event:        event,
+				ActionType:   actionType,
+				ActionAmount: actionAmount,
+				ActionToken:  actionToken,
+				GasAmount:    flow.gasAlph,
+				GasToken:     "ALPH",
+				Address:      addr,
+				Contract:     contractAddr,
+				ChainFrom:    ref.GroupFrom,
+				ChainTo:      ref.GroupTo,
+				ExplorerURL:  fmt.Sprintf("%s/#/transactions/%s", m.cfg.ExplorerURL, tx.Hash),
 			}
 			data, _ := json.Marshal(notif)
 			if err := m.stream.Publish(ctx, stream.NotificationsStream, data); err != nil {
@@ -376,6 +393,30 @@ func matchesFilter(filter string, isSender, hasSent, hasReceived, isContract boo
 	default:
 		return true
 	}
+}
+
+func deriveWebhookAction(flow txFlow, isSender, isContract bool) (event, actionType string, actionAmount float64, actionToken string) {
+	if isContract {
+		event = "contract_interaction"
+	} else if isSender {
+		event = "transfer_sent"
+	} else {
+		event = "transfer_received"
+	}
+
+	if flow.receivedAlph > 0 {
+		return event, "received", flow.receivedAlph, "ALPH"
+	}
+	for id, amt := range flow.receivedTokens {
+		return event, "received", amt, flow.tokenSymbols[id]
+	}
+	if flow.sentAlph > 0 {
+		return event, "sent", flow.sentAlph, "ALPH"
+	}
+	for id, amt := range flow.sentTokens {
+		return event, "sent", amt, flow.tokenSymbols[id]
+	}
+	return event, "", 0, ""
 }
 
 // --- Flow calculation ---
