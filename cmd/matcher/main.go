@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"html"
 	"log"
 	"math"
 	"os"
@@ -103,6 +104,7 @@ func main() {
 		explorer: exp,
 		tokens:   tok,
 		txCh:     make(chan txJob, 500),
+		lastSeen: make(map[string]int),
 	}
 
 	var wg sync.WaitGroup
@@ -145,6 +147,7 @@ type matcher struct {
 	explorer *explorer.Client
 	tokens   *tokens.Cache
 	txCh     chan txJob
+	lastSeen map[string]int
 }
 
 func (m *matcher) consumeBlocks(ctx context.Context) {
@@ -187,12 +190,35 @@ func (m *matcher) consumeBlocks(ctx context.Context) {
 }
 
 func (m *matcher) processBlock(ctx context.Context, block *models.WsBlockNotify) {
+	chainKey := fmt.Sprintf("%d->%d", block.Params.ChainFrom, block.Params.ChainTo)
+	height := block.Params.Height
+
+	if last, ok := m.lastSeen[chainKey]; ok {
+		switch {
+		case height > last+1:
+			log.Printf("WARN possible missed blocks on chain %s: last=%d current=%d gap=%d block=%s", chainKey, last, height, height-last-1, block.Params.Hash)
+		case height <= last:
+			log.Printf("INFO non-monotonic block on chain %s: last=%d current=%d block=%s", chainKey, last, height, block.Params.Hash)
+		}
+	}
+	m.lastSeen[chainKey] = height
+
+	if m.cfg.VerboseLogs {
+		log.Printf("DEBUG block received chain=%s height=%d hash=%s txs=%d", chainKey, height, block.Params.Hash, len(block.Params.Transactions))
+	}
+
+	queued := 0
+	skippedNoInputs := 0
+	skippedNotWatched := 0
+
 	for _, tx := range block.Params.Transactions {
 		if len(tx.Unsigned.Inputs) == 0 {
+			skippedNoInputs++
 			continue
 		}
 
 		if !m.txMatchesWatched(ctx, tx) {
+			skippedNotWatched++
 			continue
 		}
 
@@ -206,9 +232,14 @@ func (m *matcher) processBlock(ctx context.Context, block *models.WsBlockNotify)
 		select {
 		case m.txCh <- txJob{ref: ref, block: block}:
 			matcherTxJobsEnqueuedTotal.Inc()
+			queued++
 		case <-ctx.Done():
 			return
 		}
+	}
+
+	if m.cfg.VerboseLogs {
+		log.Printf("DEBUG block processed chain=%s height=%d queued=%d skipped_no_inputs=%d skipped_not_watched=%d", chainKey, height, queued, skippedNoInputs, skippedNotWatched)
 	}
 }
 
@@ -239,7 +270,9 @@ func (m *matcher) txWorker(ctx context.Context) {
 
 func (m *matcher) processTx(ctx context.Context, ref models.TxRef) {
 	start := time.Now()
-	defer matcherTxProcessDuration.Observe(time.Since(start).Seconds())
+	defer func() {
+		matcherTxProcessDuration.Observe(time.Since(start).Seconds())
+	}()
 
 	tx, err := m.explorer.FetchTransaction(ctx, ref.ID)
 	if err != nil {
@@ -308,11 +341,18 @@ func (m *matcher) processTx(ctx context.Context, ref models.TxRef) {
 			if !matchesFilter(sub.Filter, isSender, hasSent, hasReceived, isContract) {
 				continue
 			}
+			msgOut := msg
+			if sub.Channel == models.ChannelTelegram {
+				if label := m.store.GetAddressLabel(ctx, sub.ChatID, addr); label != "" {
+					msgOut = fmt.Sprintf("🏷️ <b>%s</b>\n\n%s", html.EscapeString(label), msg)
+				}
+			}
+
 			notif := models.Notification{
 				Channel: sub.Channel,
 				ChatID:  sub.ChatID,
 				URL:     sub.URL,
-				Message: msg,
+				Message: msgOut,
 			}
 			data, _ := json.Marshal(notif)
 			if err := m.stream.Publish(ctx, stream.NotificationsStream, data); err != nil {

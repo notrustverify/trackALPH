@@ -15,6 +15,7 @@ const (
 	keyWatched    = "trackalph:watched"
 	keyAddrPrefix = "trackalph:addr:"
 	keyUserPrefix = "trackalph:user:"
+	keyLabelPrefix = "trackalph:userlabel:"
 	keyWhPrefix   = "trackalph:userwh:"
 
 	FilterAll = "all"
@@ -36,6 +37,7 @@ type Subscriber struct {
 type Subscription struct {
 	Address string
 	Filter  string
+	Label   string
 }
 
 type WebhookSubscription struct {
@@ -56,7 +58,7 @@ func New(rdb *redis.Client) *Store {
 
 // --- Telegram subscriptions ---
 
-func (s *Store) AddSubscription(ctx context.Context, chatID int64, address, filter string) error {
+func (s *Store) AddSubscription(ctx context.Context, chatID int64, address, filter, label string) error {
 	if filter == "" {
 		filter = FilterAll
 	}
@@ -66,6 +68,11 @@ func (s *Store) AddSubscription(ctx context.Context, chatID int64, address, filt
 	pipe.SAdd(ctx, keyWatched, address)
 	pipe.HSet(ctx, keyAddrPrefix+address, field, filter)
 	pipe.HSet(ctx, keyUserPrefix+chatStr, address, filter)
+	if label != "" {
+		pipe.HSet(ctx, keyLabelPrefix+chatStr, address, label)
+	} else {
+		pipe.HDel(ctx, keyLabelPrefix+chatStr, address)
+	}
 	_, err := pipe.Exec(ctx)
 	return err
 }
@@ -76,6 +83,7 @@ func (s *Store) RemoveSubscription(ctx context.Context, chatID int64, address st
 	pipe := s.rdb.Pipeline()
 	pipe.HDel(ctx, keyAddrPrefix+address, field)
 	pipe.HDel(ctx, keyUserPrefix+chatStr, address)
+	pipe.HDel(ctx, keyLabelPrefix+chatStr, address)
 	_, err := pipe.Exec(ctx)
 	if err != nil {
 		return err
@@ -90,11 +98,21 @@ func (s *Store) GetSubscriptionsForChatID(ctx context.Context, chatID int64) ([]
 	if err != nil {
 		return nil, err
 	}
+	labels, _ := s.rdb.HGetAll(ctx, keyLabelPrefix+chatStr).Result()
 	var subs []Subscription
 	for addr, filter := range entries {
-		subs = append(subs, Subscription{Address: addr, Filter: filter})
+		subs = append(subs, Subscription{Address: addr, Filter: filter, Label: labels[addr]})
 	}
 	return subs, nil
+}
+
+func (s *Store) GetAddressLabel(ctx context.Context, chatID int64, address string) string {
+	chatStr := strconv.FormatInt(chatID, 10)
+	val, err := s.rdb.HGet(ctx, keyLabelPrefix+chatStr, address).Result()
+	if err != nil {
+		return ""
+	}
+	return val
 }
 
 // --- Webhook subscriptions ---

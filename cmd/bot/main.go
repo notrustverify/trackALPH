@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"html"
 	"log"
 	"net/url"
 	"os"
@@ -183,10 +184,16 @@ func processCommand(ctx context.Context, bot *tgbotapi.BotAPI, st *store.Store, 
 // --- /watch: validate address then show filter buttons ---
 
 func handleWatch(bot *tgbotapi.BotAPI, chatID int64, args string) {
-	address := strings.TrimSpace(args)
-	if address == "" {
-		sendMessage(bot, chatID, "Usage: <code>/watch &lt;address&gt;</code>")
+	raw := strings.TrimSpace(args)
+	if raw == "" {
+		sendMessage(bot, chatID, "Usage: <code>/watch &lt;address&gt; [label]</code>")
 		return
+	}
+	parts := strings.Fields(raw)
+	address := parts[0]
+	label := ""
+	if len(parts) > 1 {
+		label = sanitizeLabel(strings.TrimSpace(strings.TrimPrefix(raw, address)))
 	}
 
 	if !isValidAlephiumAddress(address) {
@@ -194,8 +201,11 @@ func handleWatch(bot *tgbotapi.BotAPI, chatID int64, args string) {
 		return
 	}
 
-	msg := tgbotapi.NewMessage(chatID, fmt.Sprintf(
-		"Choose notification filter for:\n<code>%s</code>", address))
+	text := fmt.Sprintf("Choose notification filter for:\n<code>%s</code>", address)
+	if label != "" {
+		text += fmt.Sprintf("\nLabel: <code>%s</code>", html.EscapeString(label))
+	}
+	msg := tgbotapi.NewMessage(chatID, text)
 	msg.ParseMode = tgbotapi.ModeHTML
 
 	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
@@ -328,7 +338,7 @@ func handleCallback(ctx context.Context, bot *tgbotapi.BotAPI, st *store.Store, 
 }
 
 func handleWatchCallback(ctx context.Context, bot *tgbotapi.BotAPI, st *store.Store, chatID int64, msgID int, filter string, sourceText string) {
-	address := extractAddressFromPrompt(sourceText)
+	address, label := extractWatchSelection(sourceText)
 	if address == "" {
 		editMessageText(bot, chatID, msgID, "Could not read address from selection message. Please run /watch again.")
 		return
@@ -337,24 +347,38 @@ func handleWatchCallback(ctx context.Context, bot *tgbotapi.BotAPI, st *store.St
 		return
 	}
 
-	if err := st.AddSubscription(ctx, chatID, address, filter); err != nil {
+	if err := st.AddSubscription(ctx, chatID, address, filter, label); err != nil {
 		log.Printf("Error adding subscription: %v", err)
 		editMessageText(bot, chatID, msgID, "Error saving subscription. Please try again.")
 		return
 	}
 
-	editMessageText(bot, chatID, msgID,
-		fmt.Sprintf("✅ Now watching address:\n<code>%s</code>\nFilter: <b>%s</b>", maskAddress(address), filterLabel(filter)))
+	confirm := fmt.Sprintf("✅ Now watching address:\n<code>%s</code>\nFilter: <b>%s</b>", maskAddress(address), filterLabel(filter))
+	if label != "" {
+		confirm += fmt.Sprintf("\nLabel: <code>%s</code>", html.EscapeString(label))
+	}
+	editMessageText(bot, chatID, msgID, confirm)
 }
 
-func extractAddressFromPrompt(text string) string {
+func extractWatchSelection(text string) (string, string) {
 	// Prompt format:
-	// "Choose notification filter for:\n<address>"
+	// "Choose notification filter for:\n<address>\nLabel: <label>"
 	lines := strings.Split(strings.TrimSpace(text), "\n")
-	if len(lines) < 2 {
-		return ""
+	var address, label string
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "Choose notification filter for:") {
+			continue
+		}
+		if strings.HasPrefix(line, "Label: ") {
+			label = strings.TrimSpace(strings.TrimPrefix(line, "Label: "))
+			continue
+		}
+		if address == "" {
+			address = line
+		}
 	}
-	return strings.TrimSpace(lines[len(lines)-1])
+	return address, sanitizeLabel(label)
 }
 
 func maskAddress(addr string) string {
@@ -362,6 +386,14 @@ func maskAddress(addr string) string {
 		return addr
 	}
 	return addr[:5] + "..." + addr[len(addr)-5:]
+}
+
+func sanitizeLabel(label string) string {
+	label = strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(label, "\n", " "), "\r", " "))
+	if len(label) > 80 {
+		label = label[:80]
+	}
+	return label
 }
 
 func handleWebhookCallback(ctx context.Context, bot *tgbotapi.BotAPI, st *store.Store, chatID int64, msgID int, data string) {
@@ -442,7 +474,11 @@ func handleList(ctx context.Context, bot *tgbotapi.BotAPI, st *store.Store, chat
 			if icon == "" {
 				icon = "↕️"
 			}
-			sb.WriteString(fmt.Sprintf("%d. %s <code>%s</code>\n", i+1, icon, sub.Address))
+			sb.WriteString(fmt.Sprintf("%d. %s <code>%s</code>", i+1, icon, sub.Address))
+			if sub.Label != "" {
+				sb.WriteString(fmt.Sprintf(" — <i>%s</i>", html.EscapeString(sub.Label)))
+			}
+			sb.WriteString("\n")
 		}
 	}
 
@@ -590,7 +626,7 @@ func helpMessage() string {
 	return `<b>TrackAlph Bot - Commands</b>
 
 <b>Telegram notifications:</b>
-/watch &lt;address&gt; - Watch an address (choose filter via buttons)
+/watch &lt;address&gt; [label] - Watch an address (choose filter via buttons)
 /unwatch &lt;address&gt; - Stop watching an address
 
 <b>Other:</b>
