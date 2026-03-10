@@ -613,7 +613,7 @@ func welcomeMessage() string {
 I notify you when transactions happen on your Alephium addresses.
 
 <b>Commands:</b>
-/watch &lt;address&gt; - Watch via Telegram
+/watch &lt;address&gt; [label] - Watch via Telegram
 /unwatch &lt;address&gt; - Stop Telegram notifications
 /list - Show all subscriptions
 /help - Show this help
@@ -632,6 +632,10 @@ func helpMessage() string {
 <b>Other:</b>
 /list - List all subscriptions
 /help - Show this help message
+
+<b>Label examples:</b>
+<code>/watch 1Abc... main wallet</code>
+<code>/watch 1Abc... treasury</code>
 
 To change a filter, just re-register with the same address.`
 }
