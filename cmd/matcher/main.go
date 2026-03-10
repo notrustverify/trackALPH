@@ -334,10 +334,6 @@ func (m *matcher) processTx(ctx context.Context, ref models.TxRef) {
 		}
 
 		for _, sub := range m.store.GetSubscribersForAddress(ctx, addr) {
-			if sub.Channel != models.ChannelTelegram {
-				// Webhook channel is temporarily disabled.
-				continue
-			}
 			if !matchesFilter(sub.Filter, isSender, hasSent, hasReceived, isContract) {
 				continue
 			}

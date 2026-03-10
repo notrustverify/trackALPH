@@ -9,8 +9,10 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -64,7 +66,17 @@ var (
 		Name: "trackalph_bot_messages_sent_total",
 		Help: "Total Telegram messages send attempts by status.",
 	}, []string{"status"})
+
+	webhookSelectionSeq int64
+	webhookSelectionMu  sync.Mutex
+	webhookSelections   = make(map[string]webhookSelection)
 )
+
+type webhookSelection struct {
+	Address   string
+	URL       string
+	CreatedAt time.Time
+}
 
 func main() {
 	cfg := config.Load()
@@ -173,9 +185,9 @@ func processCommand(ctx context.Context, bot *tgbotapi.BotAPI, st *store.Store, 
 	case "list":
 		handleList(ctx, bot, st, chatID)
 	case "webhook":
-		sendMessage(bot, chatID, "Webhook notifications are temporarily disabled.")
+		handleWebhookCmd(ctx, bot, st, chatID, msg.CommandArguments())
 	case "rmwebhook":
-		sendMessage(bot, chatID, "Webhook notifications are temporarily disabled.")
+		handleRmWebhook(ctx, bot, st, chatID, msg.CommandArguments())
 	default:
 		sendMessage(bot, chatID, "Unknown command. Use /help for available commands.")
 	}
@@ -250,13 +262,12 @@ func handleWebhookCmd(ctx context.Context, bot *tgbotapi.BotAPI, st *store.Store
 		return
 	}
 
+	token := putWebhookSelection(address, webhookURL)
 	msg := tgbotapi.NewMessage(chatID, fmt.Sprintf(
 		"Choose webhook filter for:\n<code>%s</code>\n\nURL: %s", address, webhookURL))
 	msg.ParseMode = tgbotapi.ModeHTML
 
-	cbData := func(filter string) string {
-		return callbackWebhook + filter + ":" + address + "|" + webhookURL
-	}
+	cbData := func(filter string) string { return callbackWebhook + filter + ":" + token }
 
 	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
@@ -396,19 +407,57 @@ func sanitizeLabel(label string) string {
 	return label
 }
 
+func putWebhookSelection(address, webhookURL string) string {
+	id := atomic.AddInt64(&webhookSelectionSeq, 1)
+	token := strconv.FormatInt(time.Now().UnixNano(), 36) + strconv.FormatInt(id, 36)
+
+	webhookSelectionMu.Lock()
+	defer webhookSelectionMu.Unlock()
+	cleanupWebhookSelectionsLocked()
+	webhookSelections[token] = webhookSelection{
+		Address:   address,
+		URL:       webhookURL,
+		CreatedAt: time.Now(),
+	}
+	return token
+}
+
+func popWebhookSelection(token string) (webhookSelection, bool) {
+	webhookSelectionMu.Lock()
+	defer webhookSelectionMu.Unlock()
+	cleanupWebhookSelectionsLocked()
+	sel, ok := webhookSelections[token]
+	if !ok {
+		return webhookSelection{}, false
+	}
+	delete(webhookSelections, token)
+	return sel, true
+}
+
+func cleanupWebhookSelectionsLocked() {
+	cutoff := time.Now().Add(-15 * time.Minute)
+	for k, v := range webhookSelections {
+		if v.CreatedAt.Before(cutoff) {
+			delete(webhookSelections, k)
+		}
+	}
+}
+
 func handleWebhookCallback(ctx context.Context, bot *tgbotapi.BotAPI, st *store.Store, chatID int64, msgID int, data string) {
-	// Format: "<filter>:<address>|<url>"
+	// Format: "<filter>:<token>"
 	parts := strings.SplitN(data, ":", 2)
 	if len(parts) != 2 {
 		return
 	}
 	filter := parts[0]
-	addrURL := parts[1]
-
-	address, webhookURL, ok := strings.Cut(addrURL, "|")
+	token := parts[1]
+	sel, ok := popWebhookSelection(token)
 	if !ok {
+		editMessageText(bot, chatID, msgID, "Webhook selection expired. Please run /webhook again.")
 		return
 	}
+	address := sel.Address
+	webhookURL := sel.URL
 
 	if filter != store.FilterAll && filter != store.FilterIn && filter != store.FilterOut {
 		return
@@ -614,12 +663,16 @@ I notify you when transactions happen on your Alephium addresses.
 
 <b>Commands:</b>
 /watch &lt;address&gt; [label] - Watch via Telegram
+/webhook &lt;address&gt; &lt;url&gt; - Watch via webhook
 /unwatch &lt;address&gt; - Stop Telegram notifications
+/rmwebhook &lt;address&gt; - Remove webhook
 /list - Show all subscriptions
 /help - Show this help
 
 Get started by sending:
-<code>/watch YOUR_ALEPHIUM_ADDRESS</code>`
+<code>/watch YOUR_ALEPHIUM_ADDRESS</code>
+
+Developed by <a href="https://notrustverify.ch">notrustverify.ch</a>`
 }
 
 func helpMessage() string {
@@ -630,6 +683,9 @@ func helpMessage() string {
 /unwatch &lt;address&gt; - Stop watching an address
 
 <b>Other:</b>
+/webhook &lt;address&gt; &lt;url&gt; - Register a webhook
+/webhook - List your webhooks
+/rmwebhook &lt;address&gt; - Remove a webhook
 /list - List all subscriptions
 /help - Show this help message
 
@@ -637,7 +693,9 @@ func helpMessage() string {
 <code>/watch 1Abc... main wallet</code>
 <code>/watch 1Abc... treasury</code>
 
-To change a filter, just re-register with the same address.`
+To change a filter, just re-register with the same address.
+
+Developed by <a href="https://notrustverify.ch">notrustverify.ch</a>`
 }
 
 func isValidAlephiumAddress(addr string) bool {
