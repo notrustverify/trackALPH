@@ -118,15 +118,16 @@ type Notification struct {
 	Message string `json:"message"`
 }
 
-// WebhookPayload is the JSON body POSTed to user webhook URLs.
-type WebhookPayload struct {
-	Address   string  `json:"address"`
-	TxID      string  `json:"tx_id"`
-	Direction string  `json:"direction"`
-	AlphSent  float64 `json:"alph_sent,omitempty"`
-	AlphRecv  float64 `json:"alph_received,omitempty"`
-	IsContract bool   `json:"is_contract"`
-	Message   string  `json:"message"`
+// WebhookEvent is the JSON envelope POSTed to user webhook URLs.
+type WebhookEvent struct {
+	Type      string          `json:"type"`
+	Timestamp string          `json:"timestamp"`
+	Data      WebhookEventData `json:"data"`
+}
+
+type WebhookEventData struct {
+	Message string `json:"message"`
+	Channel string `json:"channel,omitempty"`
 }
 
 // Constants

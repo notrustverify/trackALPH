@@ -137,8 +137,13 @@ func deliveryWorker(ctx context.Context, ch <-chan models.Notification) {
 }
 
 func deliverWebhook(ctx context.Context, notif models.Notification) {
-	payload := models.WebhookPayload{
-		Message: notif.Message,
+	payload := models.WebhookEvent{
+		Type:      "trackalph.notification",
+		Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+		Data: models.WebhookEventData{
+			Message: notif.Message,
+			Channel: notif.Channel,
+		},
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
