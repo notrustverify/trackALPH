@@ -74,6 +74,14 @@ var (
 		Name: "trackalph_addresses_tracked_webhook",
 		Help: "Current number of unique addresses tracked by at least one webhook subscriber.",
 	})
+	addressesTrackedEthereumGauge = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "trackalph_addresses_tracked_ethereum",
+		Help: "Current number of unique Ethereum addresses being tracked.",
+	})
+	addressesTrackedAlephiumGauge = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "trackalph_addresses_tracked_alephium",
+		Help: "Current number of unique Alephium addresses being tracked.",
+	})
 	botMessagesSentTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "trackalph_bot_messages_sent_total",
 		Help: "Total Telegram messages send attempts by status.",
@@ -610,10 +618,13 @@ func reportAddressMetrics(ctx context.Context, st *store.Store) {
 
 	for {
 		total, telegram, webhook := st.CountWatchedAddressesByChannel(ctx)
+		ethereum, alephium := st.CountWatchedAddressesByChain(ctx)
 		addressesTrackedGauge.Set(float64(total))
 		addressesTrackedTotalGauge.Set(float64(total))
 		addressesTrackedTelegramGauge.Set(float64(telegram))
 		addressesTrackedWebhookGauge.Set(float64(webhook))
+		addressesTrackedEthereumGauge.Set(float64(ethereum))
+		addressesTrackedAlephiumGauge.Set(float64(alephium))
 		select {
 		case <-ctx.Done():
 			return
@@ -701,7 +712,7 @@ I notify you when transactions happen on your Alephium or Ethereum addresses.
 /help - Show this help
 
 Get started by sending:
-<code>/watch YOUR_ALEPHIUM_ADDRESS</code>
+<code>/watch YOUR_ALEPHIUM_OR_ETH_ADDRESS</code>
 
 Developed by <a href="https://notrustverify.ch">notrustverify.ch</a>`
 }
@@ -712,6 +723,10 @@ func helpMessage() string {
 <b>Telegram notifications:</b>
 /watch &lt;address&gt; [label] - Watch an address (choose filter via buttons)
 /unwatch &lt;address&gt; - Stop watching an address
+
+<b>Address formats:</b>
+• Alephium: base58 (e.g. <code>1ABC...</code>)
+• Ethereum: <code>0x...</code>
 
 <b>Other:</b>
 /webhook &lt;address&gt; &lt;url&gt; - Register a webhook
