@@ -9,6 +9,7 @@ import (
 
 const (
 	BlocksStream        = "trackalph:blocks"
+	EthBlocksStream     = "trackalph:eth:blocks"
 	NotificationsStream = "trackalph:notifications"
 )
 

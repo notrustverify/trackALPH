@@ -1,14 +1,18 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"html"
 	"log"
 	"math"
+	"math/big"
+	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -30,9 +34,13 @@ import (
 const (
 	groupName    = "matchers"
 	consumerName = "matcher-1"
+	ethGroupName = "matchers-eth"
+	ethConsumer  = "matcher-eth-1"
 	numWorkers   = 10
 	metricsAddr  = ":2113"
 )
+
+var ethHTTPClient = &http.Client{Timeout: 15 * time.Second}
 
 var (
 	matcherBlocksConsumedTotal = promauto.NewCounter(prometheus.CounterOpts{
@@ -96,6 +104,11 @@ func main() {
 	if err := str.CreateGroup(ctx, stream.BlocksStream, groupName); err != nil {
 		log.Fatalf("Failed to create consumer group: %v", err)
 	}
+	if cfg.EthRPC != "" {
+		if err := str.CreateGroup(ctx, stream.EthBlocksStream, ethGroupName); err != nil {
+			log.Fatalf("Failed to create ETH consumer group: %v", err)
+		}
+	}
 
 	m := &matcher{
 		cfg:      cfg,
@@ -122,6 +135,14 @@ func main() {
 		defer wg.Done()
 		m.consumeBlocks(ctx)
 	}()
+
+	if cfg.EthRPC != "" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			m.consumeEthBlocks(ctx)
+		}()
+	}
 
 	log.Println("Matcher is running")
 
@@ -187,6 +208,280 @@ func (m *matcher) consumeBlocks(ctx context.Context) {
 			m.stream.Ack(ctx, stream.BlocksStream, groupName, msg.ID)
 		}
 	}
+}
+
+func (m *matcher) consumeEthBlocks(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		msgs, err := m.stream.Consume(ctx, stream.EthBlocksStream, ethGroupName, ethConsumer)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			log.Printf("Error consuming ETH blocks: %v", err)
+			time.Sleep(1 * time.Second)
+			continue
+		}
+
+		for _, msg := range msgs {
+			data, ok := msg.Values["data"].(string)
+			if !ok {
+				m.stream.Ack(ctx, stream.EthBlocksStream, ethGroupName, msg.ID)
+				continue
+			}
+			var ref models.EthBlockRef
+			if err := json.Unmarshal([]byte(data), &ref); err != nil {
+				m.stream.Ack(ctx, stream.EthBlocksStream, ethGroupName, msg.ID)
+				continue
+			}
+			m.processEthBlock(ctx, ref)
+			m.stream.Ack(ctx, stream.EthBlocksStream, ethGroupName, msg.ID)
+		}
+	}
+}
+
+type ethRPCRequest struct {
+	JSONRPC string `json:"jsonrpc"`
+	ID      int    `json:"id"`
+	Method  string `json:"method"`
+	Params  []any  `json:"params"`
+}
+
+type ethRPCResponse struct {
+	Result json.RawMessage `json:"result"`
+	Error  *struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+	} `json:"error,omitempty"`
+}
+
+type ethTx struct {
+	Hash  string `json:"hash"`
+	From  string `json:"from"`
+	To    string `json:"to"`
+	Value string `json:"value"`
+	Input string `json:"input"`
+}
+
+type ethBlock struct {
+	Number       string  `json:"number"`
+	Hash         string  `json:"hash"`
+	Transactions []ethTx `json:"transactions"`
+}
+
+type ethReceipt struct {
+	Status            string `json:"status"`
+	GasUsed           string `json:"gasUsed"`
+	EffectiveGasPrice string `json:"effectiveGasPrice"`
+}
+
+func (m *matcher) processEthBlock(ctx context.Context, ref models.EthBlockRef) {
+	if m.cfg.EthRPC == "" || ref.Hash == "" {
+		return
+	}
+
+	var block ethBlock
+	if err := m.ethRPCCall(ctx, "eth_getBlockByHash", []any{ref.Hash, true}, &block); err != nil {
+		log.Printf("Error fetching ETH block %s: %v", ref.Hash, err)
+		return
+	}
+
+	blockNum := hexToInt64(block.Number)
+	for _, tx := range block.Transactions {
+		from := strings.ToLower(tx.From)
+		to := strings.ToLower(tx.To)
+		if !m.store.IsWatched(ctx, from) && (to == "" || !m.store.IsWatched(ctx, to)) {
+			continue
+		}
+
+		valueETH := weiHexToEth(tx.Value)
+		receipt := ethReceipt{}
+		_ = m.ethRPCCall(ctx, "eth_getTransactionReceipt", []any{tx.Hash}, &receipt)
+		gasETH := weiHexToEth(mulHex(receipt.GasUsed, receipt.EffectiveGasPrice))
+		success := receipt.Status == "" || receipt.Status == "0x1"
+		explorerURL := strings.TrimRight(m.cfg.EthExplorerURL, "/") + "/tx/" + tx.Hash
+
+		// sender notifications
+		if from != "" && m.store.IsWatched(ctx, from) {
+			for _, sub := range m.store.GetSubscribersForAddress(ctx, from) {
+				if !matchesFilter(sub.Filter, true, true, false, tx.Input != "0x") {
+					continue
+				}
+				msg := formatEthTransferNotification("out", from, to, valueETH, gasETH, tx.Hash, blockNum, success, explorerURL)
+				if sub.Channel == models.ChannelTelegram {
+					if label := m.store.GetAddressLabel(ctx, sub.ChatID, from); label != "" {
+						msg = fmt.Sprintf("🏷️ <b>%s</b>\n\n%s", html.EscapeString(label), msg)
+					}
+				}
+				notif := models.Notification{
+					Channel:      sub.Channel,
+					ChatID:       sub.ChatID,
+					URL:          sub.URL,
+					Message:      msg,
+					Event:        ethEventType("out", tx.Input != "0x"),
+					ActionType:   "sent",
+					ActionAmount: valueETH,
+					ActionToken:  "ETH",
+					GasAmount:    gasETH,
+					GasToken:     "ETH",
+					Address:      from,
+					Contract:     to,
+					ChainFrom:    0,
+					ChainTo:      0,
+					ExplorerURL:  explorerURL,
+				}
+				data, _ := json.Marshal(notif)
+				if err := m.stream.Publish(ctx, stream.NotificationsStream, data); err != nil {
+					log.Printf("Error publishing ETH notification: %v", err)
+				}
+			}
+		}
+
+		// receiver notifications
+		if to != "" && m.store.IsWatched(ctx, to) {
+			for _, sub := range m.store.GetSubscribersForAddress(ctx, to) {
+				if !matchesFilter(sub.Filter, false, false, true, tx.Input != "0x") {
+					continue
+				}
+				msg := formatEthTransferNotification("in", from, to, valueETH, 0, tx.Hash, blockNum, success, explorerURL)
+				if sub.Channel == models.ChannelTelegram {
+					if label := m.store.GetAddressLabel(ctx, sub.ChatID, to); label != "" {
+						msg = fmt.Sprintf("🏷️ <b>%s</b>\n\n%s", html.EscapeString(label), msg)
+					}
+				}
+				notif := models.Notification{
+					Channel:      sub.Channel,
+					ChatID:       sub.ChatID,
+					URL:          sub.URL,
+					Message:      msg,
+					Event:        ethEventType("in", tx.Input != "0x"),
+					ActionType:   "received",
+					ActionAmount: valueETH,
+					ActionToken:  "ETH",
+					GasAmount:    0,
+					GasToken:     "ETH",
+					Address:      to,
+					Contract:     from,
+					ChainFrom:    0,
+					ChainTo:      0,
+					ExplorerURL:  explorerURL,
+				}
+				data, _ := json.Marshal(notif)
+				if err := m.stream.Publish(ctx, stream.NotificationsStream, data); err != nil {
+					log.Printf("Error publishing ETH notification: %v", err)
+				}
+			}
+		}
+	}
+}
+
+func (m *matcher) ethRPCCall(ctx context.Context, method string, params []any, out any) error {
+	reqBody := ethRPCRequest{
+		JSONRPC: "2.0",
+		ID:      1,
+		Method:  method,
+		Params:  params,
+	}
+	b, _ := json.Marshal(reqBody)
+	rpcURL := m.cfg.EthRPC
+	if !strings.HasPrefix(rpcURL, "http://") && !strings.HasPrefix(rpcURL, "https://") {
+		rpcURL = "http://" + rpcURL
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rpcURL, bytes.NewReader(b))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := ethHTTPClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	var rpcResp ethRPCResponse
+	if err := json.NewDecoder(resp.Body).Decode(&rpcResp); err != nil {
+		return err
+	}
+	if rpcResp.Error != nil {
+		return fmt.Errorf("%s: %s", method, rpcResp.Error.Message)
+	}
+	if len(rpcResp.Result) == 0 || string(rpcResp.Result) == "null" {
+		return nil
+	}
+	return json.Unmarshal(rpcResp.Result, out)
+}
+
+func ethEventType(dir string, isContract bool) string {
+	if isContract {
+		return "contract_interaction"
+	}
+	if dir == "out" {
+		return "transfer_sent"
+	}
+	return "transfer_received"
+}
+
+func formatEthTransferNotification(direction, from, to string, amount, gas float64, txHash string, blockNum int64, success bool, explorerURL string) string {
+	var b strings.Builder
+	if direction == "out" {
+		fmt.Fprintf(&b, "📤 <b>ETH Sent</b>\n\n")
+	} else {
+		fmt.Fprintf(&b, "📥 <b>ETH Received</b>\n\n")
+	}
+	fmt.Fprintf(&b, "💰 <b>%s ETH</b>\n", humanizeNumber(amount))
+	if direction == "out" && gas > 0 {
+		fmt.Fprintf(&b, "⛽ Gas: %s ETH\n", humanizeNumber(gas))
+	}
+	fmt.Fprintf(&b, "\nFrom: <code>%s</code>\n", truncateAddress(from))
+	if to != "" {
+		fmt.Fprintf(&b, "To: <code>%s</code>\n", truncateAddress(to))
+	}
+	fmt.Fprintf(&b, "Block: %d\n", blockNum)
+	if !success {
+		fmt.Fprintf(&b, "Status: ❌ Failed\n")
+	}
+	fmt.Fprintf(&b, "\n<a href=\"%s\">View on Explorer</a>", explorerURL)
+	return b.String()
+}
+
+func hexToInt64(s string) int64 {
+	if s == "" {
+		return 0
+	}
+	v, _ := strconv.ParseInt(strings.TrimPrefix(s, "0x"), 16, 64)
+	return v
+}
+
+func weiHexToEth(s string) float64 {
+	if s == "" || s == "0x" {
+		return 0
+	}
+	i := new(big.Int)
+	i.SetString(strings.TrimPrefix(s, "0x"), 16)
+	f := new(big.Float).SetInt(i)
+	div := new(big.Float).SetFloat64(1e18)
+	out, _ := new(big.Float).Quo(f, div).Float64()
+	return out
+}
+
+func mulHex(a, b string) string {
+	av := new(big.Int)
+	bv := new(big.Int)
+	if _, ok := av.SetString(strings.TrimPrefix(a, "0x"), 16); !ok {
+		return "0x0"
+	}
+	if _, ok := bv.SetString(strings.TrimPrefix(b, "0x"), 16); !ok {
+		return "0x0"
+	}
+	if av.Sign() == 0 || bv.Sign() == 0 {
+		return "0x0"
+	}
+	return "0x" + new(big.Int).Mul(av, bv).Text(16)
 }
 
 func (m *matcher) processBlock(ctx context.Context, block *models.WsBlockNotify) {

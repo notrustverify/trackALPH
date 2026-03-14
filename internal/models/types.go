@@ -106,6 +106,11 @@ type TxRef struct {
 	Height    int    `json:"height"`
 }
 
+type EthBlockRef struct {
+	Hash   string `json:"hash"`
+	Number string `json:"number"`
+}
+
 const (
 	ChannelTelegram = "telegram"
 	ChannelWebhook  = "webhook"

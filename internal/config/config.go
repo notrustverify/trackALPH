@@ -14,6 +14,9 @@ type Config struct {
 	FullnodeAPI   string
 	ExplorerAPI   string
 	ExplorerURL   string
+	EthWS         string
+	EthRPC        string
+	EthExplorerURL string
 	TokenListURL  string
 	RedisURL      string
 	VerboseLogs   bool
@@ -30,6 +33,9 @@ func Load() Config {
 		FullnodeAPI:   getEnvDefault("FULLNODE_API", "https://node.mainnet.alephium.org"),
 		ExplorerAPI:   getEnvDefault("EXPLORER_API", "https://backend.mainnet.alephium.org"),
 		ExplorerURL:   getEnvDefault("EXPLORER_URL", "https://explorer.alephium.org"),
+		EthWS:         getEnvDefault("ETH_WS", ""),
+		EthRPC:        getEnvDefault("ETH_RPC", ""),
+		EthExplorerURL: getEnvDefault("ETH_EXPLORER_URL", "https://etherscan.io"),
 		TokenListURL:  getEnvDefault("TOKEN_LIST_URL", "https://raw.githubusercontent.com/alephium/token-list/refs/heads/master/tokens/mainnet.json"),
 		RedisURL:      getEnvDefault("REDIS_URL", "redis://localhost:6379"),
 		VerboseLogs:   getEnvBool("VERBOSE_LOGS", false),

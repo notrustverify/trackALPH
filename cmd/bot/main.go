@@ -215,13 +215,19 @@ func handleWatch(bot *tgbotapi.BotAPI, chatID int64, args string) {
 	}
 	parts := strings.Fields(raw)
 	address := parts[0]
+	address = normalizeAddress(address)
 	label := ""
 	if len(parts) > 1 {
 		label = sanitizeLabel(strings.TrimSpace(strings.TrimPrefix(raw, address)))
 	}
 
-	if !isValidAlephiumAddress(address) {
-		sendMessage(bot, chatID, "Invalid Alephium address. Please check and try again.")
+	switch detectAddressType(address) {
+	case "alephium":
+		// supported today
+	case "ethereum":
+		// supported today
+	default:
+		sendMessage(bot, chatID, "Invalid address. Please provide a valid Alephium or Ethereum address.")
 		return
 	}
 
@@ -261,10 +267,16 @@ func handleWebhookCmd(ctx context.Context, bot *tgbotapi.BotAPI, st *store.Store
 	}
 
 	address := parts[0]
+	address = normalizeAddress(address)
 	webhookURL := parts[1]
 
-	if !isValidAlephiumAddress(address) {
-		sendMessage(bot, chatID, "Invalid Alephium address.")
+	switch detectAddressType(address) {
+	case "alephium":
+		// supported today
+	case "ethereum":
+		// supported today
+	default:
+		sendMessage(bot, chatID, "Invalid address.")
 		return
 	}
 
@@ -330,6 +342,7 @@ func handleWebhookList(ctx context.Context, bot *tgbotapi.BotAPI, st *store.Stor
 
 func handleRmWebhook(ctx context.Context, bot *tgbotapi.BotAPI, st *store.Store, chatID int64, args string) {
 	address := strings.TrimSpace(args)
+	address = normalizeAddress(address)
 	if address == "" {
 		sendMessage(bot, chatID, "Usage: <code>/rmwebhook &lt;address&gt;</code>")
 		return
@@ -362,6 +375,7 @@ func handleCallback(ctx context.Context, bot *tgbotapi.BotAPI, st *store.Store, 
 
 func handleWatchCallback(ctx context.Context, bot *tgbotapi.BotAPI, st *store.Store, chatID int64, msgID int, filter string, sourceText string) {
 	address, label := extractWatchSelection(sourceText)
+	address = normalizeAddress(address)
 	if address == "" {
 		editMessageText(bot, chatID, msgID, "Could not read address from selection message. Please run /watch again.")
 		return
@@ -401,7 +415,7 @@ func extractWatchSelection(text string) (string, string) {
 			address = line
 		}
 	}
-	return address, sanitizeLabel(label)
+	return normalizeAddress(address), sanitizeLabel(label)
 }
 
 func maskAddress(addr string) string {
@@ -489,6 +503,7 @@ func handleWebhookCallback(ctx context.Context, bot *tgbotapi.BotAPI, st *store.
 
 func handleUnwatch(ctx context.Context, bot *tgbotapi.BotAPI, st *store.Store, chatID int64, args string) {
 	address := strings.TrimSpace(args)
+	address = normalizeAddress(address)
 	if address == "" {
 		sendMessage(bot, chatID, "Usage: <code>/unwatch &lt;address&gt;</code>")
 		return
@@ -675,7 +690,7 @@ func consumeNotifications(ctx context.Context, bot *tgbotapi.BotAPI, str *stream
 func welcomeMessage() string {
 	return `<b>Welcome to TrackAlph!</b>
 
-I notify you when transactions happen on your Alephium addresses.
+I notify you when transactions happen on your Alephium or Ethereum addresses.
 
 <b>Commands:</b>
 /watch &lt;address&gt; [label] - Watch via Telegram
@@ -729,4 +744,43 @@ func isValidAlephiumAddress(addr string) bool {
 	}
 
 	return true
+}
+
+func normalizeAddress(addr string) string {
+	addr = strings.TrimSpace(addr)
+	if isEthereumAddress(addr) {
+		return strings.ToLower(addr)
+	}
+	return addr
+}
+
+func detectAddressType(addr string) string {
+	if isEthereumAddress(addr) {
+		return "ethereum"
+	}
+	if isValidAlephiumAddress(addr) {
+		return "alephium"
+	}
+	return ""
+}
+
+func isEthereumAddress(addr string) bool {
+	if len(addr) != 42 {
+		return false
+	}
+	if !strings.HasPrefix(addr, "0x") {
+		return false
+	}
+	for _, c := range addr[2:] {
+		if !isHexDigit(c) {
+			return false
+		}
+	}
+	return true
+}
+
+func isHexDigit(c rune) bool {
+	return (c >= '0' && c <= '9') ||
+		(c >= 'a' && c <= 'f') ||
+		(c >= 'A' && c <= 'F')
 }

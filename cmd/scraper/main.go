@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -45,6 +46,14 @@ var (
 		Name: "trackalph_scraper_ws_connected",
 		Help: "Current websocket connection status (1 connected, 0 disconnected).",
 	})
+	scraperEthHeadsReceivedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "trackalph_scraper_eth_heads_received_total",
+		Help: "Total Ethereum newHeads events received.",
+	})
+	scraperEthHeadsPublishedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "trackalph_scraper_eth_heads_published_total",
+		Help: "Total Ethereum head refs published to Redis stream.",
+	})
 )
 
 func main() {
@@ -68,6 +77,9 @@ func main() {
 	defer cancel()
 
 	go wsLoop(ctx, cfg, str)
+	if cfg.EthWS != "" {
+		go ethWsLoop(ctx, cfg, str)
+	}
 
 	log.Println("Scraper is running")
 
@@ -79,6 +91,118 @@ func main() {
 	cancel()
 	time.Sleep(500 * time.Millisecond)
 	log.Println("Scraper stopped")
+}
+
+type ethWSMessage struct {
+	Method string `json:"method"`
+	Params struct {
+		Result struct {
+			Hash   string `json:"hash"`
+			Number string `json:"number"`
+		} `json:"result"`
+		Subscription string `json:"subscription"`
+	} `json:"params"`
+}
+
+func ethWsLoop(ctx context.Context, cfg config.Config, str *stream.Client) {
+	backoff := 1 * time.Second
+	maxBackoff := 60 * time.Second
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		connStart := time.Now()
+		err := connectAndListenEth(ctx, cfg, str)
+		if err != nil && ctx.Err() == nil {
+			log.Printf("ETH WebSocket disconnected: %v, reconnecting in %v", err, backoff)
+		}
+
+		if time.Since(connStart) > 30*time.Second {
+			backoff = 1 * time.Second
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+
+		if backoff < maxBackoff {
+			backoff *= 2
+		}
+	}
+}
+
+func connectAndListenEth(ctx context.Context, cfg config.Config, str *stream.Client) error {
+	wsURL := cfg.EthWS
+	if !strings.HasPrefix(wsURL, "ws://") && !strings.HasPrefix(wsURL, "wss://") {
+		wsURL = "ws://" + wsURL
+	}
+	u, err := url.Parse(wsURL)
+	if err != nil {
+		return fmt.Errorf("parse ETH_WS: %w", err)
+	}
+	log.Printf("Connecting to ETH WebSocket: %s", u.String())
+
+	conn, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+	if err != nil {
+		return fmt.Errorf("dial eth ws: %w", err)
+	}
+	defer conn.Close()
+
+	subReq := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "eth_subscribe",
+		"params":  []any{"newHeads"},
+	}
+	if err := conn.WriteJSON(subReq); err != nil {
+		return fmt.Errorf("subscribe newHeads: %w", err)
+	}
+
+	go func() {
+		<-ctx.Done()
+		conn.WriteMessage(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+		conn.Close()
+	}()
+
+	for {
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fmt.Errorf("read eth ws: %w", err)
+		}
+
+		var ev ethWSMessage
+		if err := json.Unmarshal(msg, &ev); err != nil {
+			continue
+		}
+		if ev.Method != "eth_subscription" || ev.Params.Result.Hash == "" {
+			continue
+		}
+		scraperEthHeadsReceivedTotal.Inc()
+
+		ref := models.EthBlockRef{
+			Hash:   ev.Params.Result.Hash,
+			Number: ev.Params.Result.Number,
+		}
+		data, _ := json.Marshal(ref)
+		if err := str.Publish(ctx, stream.EthBlocksStream, data); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			log.Printf("Error publishing ETH head: %v", err)
+		} else {
+			scraperEthHeadsPublishedTotal.Inc()
+		}
+	}
 }
 
 func wsLoop(ctx context.Context, cfg config.Config, str *stream.Client) {
