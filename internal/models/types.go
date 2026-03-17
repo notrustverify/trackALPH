@@ -145,7 +145,7 @@ type WebhookEvent struct {
 
 type WebhookAction struct {
 	Type   string  `json:"type,omitempty"`
-	Amount float64 `json:"amount,omitempty"`
+	Amount float64 `json:"amount"`
 	Token  string  `json:"token,omitempty"`
 }
 
@@ -156,7 +156,7 @@ type WebhookGas struct {
 
 type WebhookEventData struct {
 	Event       string        `json:"event,omitempty"`
-	Action      WebhookAction `json:"action,omitempty"`
+	Action      WebhookAction `json:"action"`
 	Gas         WebhookGas    `json:"gas,omitempty"`
 	Address     string        `json:"address,omitempty"`
 	Contract    string        `json:"contract,omitempty"`

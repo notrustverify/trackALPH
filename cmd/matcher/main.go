@@ -300,9 +300,12 @@ func (m *matcher) processEthBlock(ctx context.Context, ref models.EthBlockRef) {
 		}
 
 		valueETH := weiHexToEth(tx.Value)
+		valueETHStr := weiHexToEthString(tx.Value)
 		receipt := ethReceipt{}
 		_ = m.ethRPCCall(ctx, "eth_getTransactionReceipt", []any{tx.Hash}, &receipt)
-		gasETH := weiHexToEth(mulHex(receipt.GasUsed, receipt.EffectiveGasPrice))
+		gasWeiHex := mulHex(receipt.GasUsed, receipt.EffectiveGasPrice)
+		gasETH := weiHexToEth(gasWeiHex)
+		gasETHStr := weiHexToEthString(gasWeiHex)
 		success := receipt.Status == "" || receipt.Status == "0x1"
 		explorerURL := strings.TrimRight(m.cfg.EthExplorerURL, "/") + "/tx/" + tx.Hash
 
@@ -312,7 +315,7 @@ func (m *matcher) processEthBlock(ctx context.Context, ref models.EthBlockRef) {
 				if !matchesFilter(sub.Filter, true, true, false, tx.Input != "0x") {
 					continue
 				}
-				msg := formatEthTransferNotification("out", from, to, valueETH, gasETH, tx.Hash, blockNum, success, explorerURL)
+				msg := formatEthTransferNotification("out", from, to, valueETHStr, gasETHStr, tx.Hash, blockNum, success, explorerURL)
 				if sub.Channel == models.ChannelTelegram {
 					if label := m.store.GetAddressLabel(ctx, sub.ChatID, from); label != "" {
 						msg = fmt.Sprintf("🏷️ <b>%s</b>\n\n%s", html.EscapeString(label), msg)
@@ -348,7 +351,7 @@ func (m *matcher) processEthBlock(ctx context.Context, ref models.EthBlockRef) {
 				if !matchesFilter(sub.Filter, false, false, true, tx.Input != "0x") {
 					continue
 				}
-				msg := formatEthTransferNotification("in", from, to, valueETH, 0, tx.Hash, blockNum, success, explorerURL)
+				msg := formatEthTransferNotification("in", from, to, valueETHStr, "0", tx.Hash, blockNum, success, explorerURL)
 				if sub.Channel == models.ChannelTelegram {
 					if label := m.store.GetAddressLabel(ctx, sub.ChatID, to); label != "" {
 						msg = fmt.Sprintf("🏷️ <b>%s</b>\n\n%s", html.EscapeString(label), msg)
@@ -426,16 +429,16 @@ func ethEventType(dir string, isContract bool) string {
 	return "transfer_received"
 }
 
-func formatEthTransferNotification(direction, from, to string, amount, gas float64, txHash string, blockNum int64, success bool, explorerURL string) string {
+func formatEthTransferNotification(direction, from, to, amount, gas, txHash string, blockNum int64, success bool, explorerURL string) string {
 	var b strings.Builder
 	if direction == "out" {
 		fmt.Fprintf(&b, "📤 <b>ETH Sent</b>\n\n")
 	} else {
 		fmt.Fprintf(&b, "📥 <b>ETH Received</b>\n\n")
 	}
-	fmt.Fprintf(&b, "💰 <b>%s ETH</b>\n", humanizeNumber(amount))
-	if direction == "out" && gas > 0 {
-		fmt.Fprintf(&b, "⛽ Gas: %s ETH\n", humanizeNumber(gas))
+	fmt.Fprintf(&b, "💰 <b>%s ETH</b>\n", amount)
+	if direction == "out" && gas != "0" {
+		fmt.Fprintf(&b, "⛽ Gas: %s ETH\n", gas)
 	}
 	fmt.Fprintf(&b, "\nFrom: <code>%s</code>\n", truncateAddress(from))
 	if to != "" {
@@ -467,6 +470,29 @@ func weiHexToEth(s string) float64 {
 	div := new(big.Float).SetFloat64(1e18)
 	out, _ := new(big.Float).Quo(f, div).Float64()
 	return out
+}
+
+func weiHexToEthString(s string) string {
+	if s == "" || s == "0x" {
+		return "0"
+	}
+	n := new(big.Int)
+	if _, ok := n.SetString(strings.TrimPrefix(s, "0x"), 16); !ok {
+		return "0"
+	}
+
+	base := big.NewInt(1_000_000_000_000_000_000) // 1e18
+	intPart := new(big.Int).Div(n, base)
+	fracPart := new(big.Int).Mod(n, base)
+	if fracPart.Sign() == 0 {
+		return intPart.String()
+	}
+	frac := fracPart.Text(10)
+	if len(frac) < 18 {
+		frac = strings.Repeat("0", 18-len(frac)) + frac
+	}
+	frac = strings.TrimRight(frac, "0")
+	return intPart.String() + "." + frac
 }
 
 func mulHex(a, b string) string {
