@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -118,6 +119,7 @@ func main() {
 		tokens:   tok,
 		txCh:     make(chan txJob, 500),
 		lastSeen: make(map[string]int),
+		ethTokenMeta: make(map[string]ethTokenMetadata),
 	}
 
 	var wg sync.WaitGroup
@@ -169,6 +171,13 @@ type matcher struct {
 	tokens   *tokens.Cache
 	txCh     chan txJob
 	lastSeen map[string]int
+	ethTokenMu sync.RWMutex
+	ethTokenMeta map[string]ethTokenMetadata
+}
+
+type ethTokenMetadata struct {
+	Symbol   string
+	Decimals int
 }
 
 func (m *matcher) consumeBlocks(ctx context.Context) {
@@ -261,11 +270,12 @@ type ethRPCResponse struct {
 }
 
 type ethTx struct {
-	Hash  string `json:"hash"`
-	From  string `json:"from"`
-	To    string `json:"to"`
-	Value string `json:"value"`
-	Input string `json:"input"`
+	Hash     string `json:"hash"`
+	From     string `json:"from"`
+	To       string `json:"to"`
+	Value    string `json:"value"`
+	Input    string `json:"input"`
+	GasPrice string `json:"gasPrice"`
 }
 
 type ethBlock struct {
@@ -278,7 +288,25 @@ type ethReceipt struct {
 	Status            string `json:"status"`
 	GasUsed           string `json:"gasUsed"`
 	EffectiveGasPrice string `json:"effectiveGasPrice"`
+	Logs              []ethLog `json:"logs"`
 }
+
+type ethLog struct {
+	Address string   `json:"address"`
+	Topics  []string `json:"topics"`
+	Data    string   `json:"data"`
+}
+
+type erc20Transfer struct {
+	TokenAddr string
+	From      string
+	To        string
+	Amount    *big.Int
+	Symbol    string
+	Decimals  int
+}
+
+const erc20TransferTopic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 
 func (m *matcher) processEthBlock(ctx context.Context, ref models.EthBlockRef) {
 	if m.cfg.EthRPC == "" || ref.Hash == "" {
@@ -295,44 +323,116 @@ func (m *matcher) processEthBlock(ctx context.Context, ref models.EthBlockRef) {
 	for _, tx := range block.Transactions {
 		from := strings.ToLower(tx.From)
 		to := strings.ToLower(tx.To)
-		if !m.store.IsWatched(ctx, from) && (to == "" || !m.store.IsWatched(ctx, to)) {
+
+		receipt := ethReceipt{}
+		_ = m.ethRPCCall(ctx, "eth_getTransactionReceipt", []any{tx.Hash}, &receipt)
+		tokenTransfers := m.extractERC20Transfers(ctx, receipt.Logs)
+
+		involved := map[string]struct{}{}
+		if from != "" && m.store.IsWatched(ctx, from) {
+			involved[from] = struct{}{}
+		}
+		if to != "" && m.store.IsWatched(ctx, to) {
+			involved[to] = struct{}{}
+		}
+		for _, tr := range tokenTransfers {
+			if tr.From != "" && m.store.IsWatched(ctx, tr.From) {
+				involved[tr.From] = struct{}{}
+			}
+			if tr.To != "" && m.store.IsWatched(ctx, tr.To) {
+				involved[tr.To] = struct{}{}
+			}
+		}
+		if len(involved) == 0 {
 			continue
 		}
 
-		valueETH := weiHexToEth(tx.Value)
-		valueETHStr := weiHexToEthString(tx.Value)
-		receipt := ethReceipt{}
-		_ = m.ethRPCCall(ctx, "eth_getTransactionReceipt", []any{tx.Hash}, &receipt)
-		gasWeiHex := mulHex(receipt.GasUsed, receipt.EffectiveGasPrice)
-		gasETH := weiHexToEth(gasWeiHex)
-		gasETHStr := weiHexToEthString(gasWeiHex)
+		gasPrice := receipt.EffectiveGasPrice
+		if gasPrice == "" || gasPrice == "0x" || gasPrice == "0x0" {
+			gasPrice = tx.GasPrice
+		}
+		gasWeiHex := mulHex(receipt.GasUsed, gasPrice)
+		gasWei := hexToBigInt(gasWeiHex)
 		success := receipt.Status == "" || receipt.Status == "0x1"
 		explorerURL := strings.TrimRight(m.cfg.EthExplorerURL, "/") + "/tx/" + tx.Hash
+		isContract := tx.Input != "0x" || len(tokenTransfers) > 0
 
-		// sender notifications
-		if from != "" && m.store.IsWatched(ctx, from) {
-			for _, sub := range m.store.GetSubscribersForAddress(ctx, from) {
-				if !matchesFilter(sub.Filter, true, true, false, tx.Input != "0x") {
+		for addr := range involved {
+			ethSentWei := big.NewInt(0)
+			ethReceivedWei := big.NewInt(0)
+			if addr == from {
+				ethSentWei = hexToBigInt(tx.Value)
+			}
+			if addr == to {
+				ethReceivedWei = hexToBigInt(tx.Value)
+			}
+
+			sentTokens := map[string]erc20Transfer{}
+			receivedTokens := map[string]erc20Transfer{}
+			for _, tr := range tokenTransfers {
+				if tr.From == addr {
+					acc := sentTokens[tr.TokenAddr]
+					if acc.Amount == nil {
+						acc = tr
+						acc.Amount = big.NewInt(0)
+					}
+					acc.Amount = new(big.Int).Add(acc.Amount, tr.Amount)
+					sentTokens[tr.TokenAddr] = acc
+				}
+				if tr.To == addr {
+					acc := receivedTokens[tr.TokenAddr]
+					if acc.Amount == nil {
+						acc = tr
+						acc.Amount = big.NewInt(0)
+					}
+					acc.Amount = new(big.Int).Add(acc.Amount, tr.Amount)
+					receivedTokens[tr.TokenAddr] = acc
+				}
+			}
+
+			hasSent := ethSentWei.Sign() > 0 || len(sentTokens) > 0
+			hasReceived := ethReceivedWei.Sign() > 0 || len(receivedTokens) > 0
+			if !hasSent && !hasReceived && !isContract {
+				continue
+			}
+
+			isSender := addr == from
+			msg := formatEthTransferNotification(
+				addr, from, to, blockNum, success, explorerURL,
+				ethSentWei, ethReceivedWei, sentTokens, receivedTokens, gasWei, isSender,
+			)
+			actionType, actionAmount, actionToken := deriveEthPrimaryAction(ethSentWei, ethReceivedWei, sentTokens, receivedTokens)
+			eventDir := "in"
+			if actionType == "sent" {
+				eventDir = "out"
+			}
+			actionGas := 0.0
+			if isSender {
+				actionGas = weiBigIntToEthFloat(gasWei)
+			}
+
+			for _, sub := range m.store.GetSubscribersForAddress(ctx, addr) {
+				if !matchesFilter(sub.Filter, isSender, hasSent, hasReceived, isContract) {
 					continue
 				}
-				msg := formatEthTransferNotification("out", from, to, valueETHStr, gasETHStr, tx.Hash, blockNum, success, explorerURL)
+				msgOut := msg
 				if sub.Channel == models.ChannelTelegram {
-					if label := m.store.GetAddressLabel(ctx, sub.ChatID, from); label != "" {
-						msg = fmt.Sprintf("🏷️ <b>%s</b>\n\n%s", html.EscapeString(label), msg)
+					if label := m.store.GetAddressLabel(ctx, sub.ChatID, addr); label != "" {
+						msgOut = fmt.Sprintf("🏷️ <b>%s</b>\n\n%s", html.EscapeString(label), msgOut)
 					}
 				}
 				notif := models.Notification{
 					Channel:      sub.Channel,
 					ChatID:       sub.ChatID,
 					URL:          sub.URL,
-					Message:      msg,
-					Event:        ethEventType("out", tx.Input != "0x"),
-					ActionType:   "sent",
-					ActionAmount: valueETH,
-					ActionToken:  "ETH",
-					GasAmount:    gasETH,
+					Message:      msgOut,
+					Event:        ethEventType(eventDir, isContract),
+					ActionType:   actionType,
+					ActionAmount: actionAmount,
+					ActionToken:  actionToken,
+					GasAmount:    actionGas,
 					GasToken:     "ETH",
-					Address:      from,
+					Address:      addr,
 					Contract:     to,
 					ChainFrom:    0,
 					ChainTo:      0,
@@ -344,43 +444,210 @@ func (m *matcher) processEthBlock(ctx context.Context, ref models.EthBlockRef) {
 				}
 			}
 		}
+	}
+}
 
-		// receiver notifications
-		if to != "" && m.store.IsWatched(ctx, to) {
-			for _, sub := range m.store.GetSubscribersForAddress(ctx, to) {
-				if !matchesFilter(sub.Filter, false, false, true, tx.Input != "0x") {
-					continue
-				}
-				msg := formatEthTransferNotification("in", from, to, valueETHStr, "0", tx.Hash, blockNum, success, explorerURL)
-				if sub.Channel == models.ChannelTelegram {
-					if label := m.store.GetAddressLabel(ctx, sub.ChatID, to); label != "" {
-						msg = fmt.Sprintf("🏷️ <b>%s</b>\n\n%s", html.EscapeString(label), msg)
-					}
-				}
-				notif := models.Notification{
-					Channel:      sub.Channel,
-					ChatID:       sub.ChatID,
-					URL:          sub.URL,
-					Message:      msg,
-					Event:        ethEventType("in", tx.Input != "0x"),
-					ActionType:   "received",
-					ActionAmount: valueETH,
-					ActionToken:  "ETH",
-					GasAmount:    0,
-					GasToken:     "ETH",
-					Address:      to,
-					Contract:     from,
-					ChainFrom:    0,
-					ChainTo:      0,
-					ExplorerURL:  explorerURL,
-				}
-				data, _ := json.Marshal(notif)
-				if err := m.stream.Publish(ctx, stream.NotificationsStream, data); err != nil {
-					log.Printf("Error publishing ETH notification: %v", err)
-				}
-			}
+func (m *matcher) extractERC20Transfers(ctx context.Context, logs []ethLog) []erc20Transfer {
+	out := make([]erc20Transfer, 0)
+	for _, lg := range logs {
+		if len(lg.Topics) < 3 || !strings.EqualFold(lg.Topics[0], erc20TransferTopic) {
+			continue
+		}
+		from := topicToAddress(lg.Topics[1])
+		to := topicToAddress(lg.Topics[2])
+		amount := hexToBigInt(lg.Data)
+		if amount.Sign() == 0 {
+			continue
+		}
+		contract := strings.ToLower(lg.Address)
+		meta := m.getEthTokenMetadata(ctx, contract)
+		out = append(out, erc20Transfer{
+			TokenAddr: contract,
+			From:      from,
+			To:        to,
+			Amount:    amount,
+			Symbol:    meta.Symbol,
+			Decimals:  meta.Decimals,
+		})
+	}
+	return out
+}
+
+func (m *matcher) getEthTokenMetadata(ctx context.Context, tokenAddr string) ethTokenMetadata {
+	if tokenAddr == "" {
+		return ethTokenMetadata{Symbol: "TOKEN", Decimals: 18}
+	}
+	tokenAddr = strings.ToLower(tokenAddr)
+	m.ethTokenMu.RLock()
+	if meta, ok := m.ethTokenMeta[tokenAddr]; ok {
+		m.ethTokenMu.RUnlock()
+		return meta
+	}
+	m.ethTokenMu.RUnlock()
+
+	meta := ethTokenMetadata{Symbol: "TOKEN", Decimals: 18}
+	if d, err := m.ethCall(ctx, tokenAddr, "0x313ce567"); err == nil {
+		if dec := int(hexToBigInt(d).Int64()); dec >= 0 && dec <= 36 {
+			meta.Decimals = dec
 		}
 	}
+	if s, err := m.ethCall(ctx, tokenAddr, "0x95d89b41"); err == nil {
+		if sym := decodeERC20Symbol(s); sym != "" {
+			meta.Symbol = sym
+		}
+	}
+
+	m.ethTokenMu.Lock()
+	m.ethTokenMeta[tokenAddr] = meta
+	m.ethTokenMu.Unlock()
+	return meta
+}
+
+func (m *matcher) ethCall(ctx context.Context, to, data string) (string, error) {
+	var out string
+	err := m.ethRPCCall(ctx, "eth_call", []any{
+		map[string]any{
+			"to":   to,
+			"data": data,
+		},
+		"latest",
+	}, &out)
+	return out, err
+}
+
+func deriveEthPrimaryAction(ethSent, ethReceived *big.Int, sentTokens, receivedTokens map[string]erc20Transfer) (string, float64, string) {
+	if tr, ok := firstTokenTransfer(receivedTokens); ok {
+		return "received", tokenAmountToFloat(tr.Amount, tr.Decimals), tr.Symbol
+	}
+	if ethReceived.Sign() > 0 {
+		return "received", weiBigIntToEthFloat(ethReceived), "ETH"
+	}
+	if tr, ok := firstTokenTransfer(sentTokens); ok {
+		return "sent", tokenAmountToFloat(tr.Amount, tr.Decimals), tr.Symbol
+	}
+	return "sent", weiBigIntToEthFloat(ethSent), "ETH"
+}
+
+func firstTokenTransfer(m map[string]erc20Transfer) (erc20Transfer, bool) {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	if len(keys) == 0 {
+		return erc20Transfer{}, false
+	}
+	sort.Strings(keys)
+	return m[keys[0]], true
+}
+
+func formatEthTransferNotification(
+	watchedAddr, from, to string, blockNum int64, success bool, explorerURL string,
+	ethSentWei, ethReceivedWei *big.Int, sentTokens, receivedTokens map[string]erc20Transfer, gasWei *big.Int, isSender bool,
+) string {
+	hasSent := ethSentWei.Sign() > 0 || len(sentTokens) > 0
+	hasReceived := ethReceivedWei.Sign() > 0 || len(receivedTokens) > 0
+
+	var b strings.Builder
+	switch {
+	case hasSent && hasReceived:
+		fmt.Fprintf(&b, "🔄 <b>ETH Wallet Activity</b>\n\n")
+	case hasSent:
+		fmt.Fprintf(&b, "📤 <b>ETH Sent</b>\n\n")
+	default:
+		fmt.Fprintf(&b, "📥 <b>ETH Received</b>\n\n")
+	}
+
+	if ethReceivedWei.Sign() > 0 {
+		fmt.Fprintf(&b, "📥 Received: <b>%s ETH</b>\n", bigIntToDecimalString(ethReceivedWei, 18))
+	}
+	if ethSentWei.Sign() > 0 {
+		fmt.Fprintf(&b, "📤 Sent: <b>%s ETH</b>\n", bigIntToDecimalString(ethSentWei, 18))
+	}
+	appendTokenLines(&b, "📥", receivedTokens)
+	appendTokenLines(&b, "📤", sentTokens)
+
+	if isSender && gasWei.Sign() > 0 {
+		fmt.Fprintf(&b, "⛽ Gas: %s ETH\n", bigIntToDecimalString(gasWei, 18))
+	}
+
+	fmt.Fprintf(&b, "\nAddress: <code>%s</code>\n", truncateAddress(watchedAddr))
+	fmt.Fprintf(&b, "From: <code>%s</code>\n", truncateAddress(from))
+	if to != "" {
+		fmt.Fprintf(&b, "To: <code>%s</code>\n", truncateAddress(to))
+	}
+	fmt.Fprintf(&b, "Block: %d\n", blockNum)
+	if !success {
+		fmt.Fprintf(&b, "Status: ❌ Failed\n")
+	}
+	fmt.Fprintf(&b, "\n<a href=\"%s\">View on Explorer</a>", explorerURL)
+	return b.String()
+}
+
+func appendTokenLines(b *strings.Builder, prefix string, transfers map[string]erc20Transfer) {
+	if len(transfers) == 0 {
+		return
+	}
+	keys := make([]string, 0, len(transfers))
+	for k := range transfers {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		tr := transfers[k]
+		symbol := tr.Symbol
+		if symbol == "" {
+			symbol = "TOKEN"
+		}
+		label := "Sent"
+		if prefix == "📥" {
+			label = "Received"
+		}
+		fmt.Fprintf(b, "%s %s: <b>%s %s</b>\n", prefix, label, bigIntToDecimalString(tr.Amount, tr.Decimals), symbol)
+	}
+}
+
+func topicToAddress(topic string) string {
+	topic = strings.TrimPrefix(strings.ToLower(topic), "0x")
+	if len(topic) < 40 {
+		return ""
+	}
+	return "0x" + topic[len(topic)-40:]
+}
+
+func decodeERC20Symbol(hexResult string) string {
+	data := strings.TrimPrefix(hexResult, "0x")
+	if len(data) == 0 {
+		return ""
+	}
+	if len(data) >= 128 {
+		lengthWord := data[64:128]
+		l := int(hexToBigInt("0x" + lengthWord).Int64())
+		start := 128
+		end := start + l*2
+		if l > 0 && end <= len(data) {
+			raw := data[start:end]
+			return strings.TrimSpace(string(hexToBytes(raw)))
+		}
+	}
+	// bytes32 fallback
+	raw := hexToBytes(data)
+	raw = bytes.TrimRight(raw, "\x00")
+	return strings.TrimSpace(string(raw))
+}
+
+func hexToBytes(s string) []byte {
+	if len(s)%2 == 1 {
+		s = "0" + s
+	}
+	out := make([]byte, 0, len(s)/2)
+	for i := 0; i+1 < len(s); i += 2 {
+		v, err := strconv.ParseUint(s[i:i+2], 16, 8)
+		if err != nil {
+			return nil
+		}
+		out = append(out, byte(v))
+	}
+	return out
 }
 
 func (m *matcher) ethRPCCall(ctx context.Context, method string, params []any, out any) error {
@@ -429,35 +696,23 @@ func ethEventType(dir string, isContract bool) string {
 	return "transfer_received"
 }
 
-func formatEthTransferNotification(direction, from, to, amount, gas, txHash string, blockNum int64, success bool, explorerURL string) string {
-	var b strings.Builder
-	if direction == "out" {
-		fmt.Fprintf(&b, "📤 <b>ETH Sent</b>\n\n")
-	} else {
-		fmt.Fprintf(&b, "📥 <b>ETH Received</b>\n\n")
-	}
-	fmt.Fprintf(&b, "💰 <b>%s ETH</b>\n", amount)
-	if direction == "out" && gas != "0" {
-		fmt.Fprintf(&b, "⛽ Gas: %s ETH\n", gas)
-	}
-	fmt.Fprintf(&b, "\nFrom: <code>%s</code>\n", truncateAddress(from))
-	if to != "" {
-		fmt.Fprintf(&b, "To: <code>%s</code>\n", truncateAddress(to))
-	}
-	fmt.Fprintf(&b, "Block: %d\n", blockNum)
-	if !success {
-		fmt.Fprintf(&b, "Status: ❌ Failed\n")
-	}
-	fmt.Fprintf(&b, "\n<a href=\"%s\">View on Explorer</a>", explorerURL)
-	return b.String()
-}
-
 func hexToInt64(s string) int64 {
 	if s == "" {
 		return 0
 	}
 	v, _ := strconv.ParseInt(strings.TrimPrefix(s, "0x"), 16, 64)
 	return v
+}
+
+func hexToBigInt(s string) *big.Int {
+	if s == "" || s == "0x" {
+		return big.NewInt(0)
+	}
+	out := new(big.Int)
+	if _, ok := out.SetString(strings.TrimPrefix(strings.ToLower(s), "0x"), 16); !ok {
+		return big.NewInt(0)
+	}
+	return out
 }
 
 func weiHexToEth(s string) float64 {
@@ -490,6 +745,51 @@ func weiHexToEthString(s string) string {
 	frac := fracPart.Text(10)
 	if len(frac) < 18 {
 		frac = strings.Repeat("0", 18-len(frac)) + frac
+	}
+	frac = strings.TrimRight(frac, "0")
+	return intPart.String() + "." + frac
+}
+
+func weiBigIntToEthFloat(v *big.Int) float64 {
+	if v == nil || v.Sign() == 0 {
+		return 0
+	}
+	f := new(big.Float).SetInt(v)
+	div := new(big.Float).SetFloat64(1e18)
+	out, _ := new(big.Float).Quo(f, div).Float64()
+	return out
+}
+
+func tokenAmountToFloat(v *big.Int, decimals int) float64 {
+	if v == nil || v.Sign() == 0 {
+		return 0
+	}
+	if decimals < 0 {
+		decimals = 0
+	}
+	scale := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(decimals)), nil)
+	f := new(big.Float).SetInt(v)
+	div := new(big.Float).SetInt(scale)
+	out, _ := new(big.Float).Quo(f, div).Float64()
+	return out
+}
+
+func bigIntToDecimalString(v *big.Int, decimals int) string {
+	if v == nil || v.Sign() == 0 {
+		return "0"
+	}
+	if decimals <= 0 {
+		return v.String()
+	}
+	base := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(decimals)), nil)
+	intPart := new(big.Int).Div(v, base)
+	fracPart := new(big.Int).Mod(v, base)
+	if fracPart.Sign() == 0 {
+		return intPart.String()
+	}
+	frac := fracPart.Text(10)
+	if len(frac) < decimals {
+		frac = strings.Repeat("0", decimals-len(frac)) + frac
 	}
 	frac = strings.TrimRight(frac, "0")
 	return intPart.String() + "." + frac
