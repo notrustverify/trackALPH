@@ -306,7 +306,17 @@ type erc20Transfer struct {
 	Decimals  int
 }
 
-const erc20TransferTopic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+const (
+	erc20TransferTopic   = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+	wethDepositTopic    = "0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c" // Deposit(address indexed dst, uint256 wad)
+	wethWithdrawalTopic = "0x7fcf532c15f0a6db0bd6d0e038bea71d30d808c7d98cb3bf7268a95bf5081b65" // Withdrawal(address indexed src, uint256 wad)
+)
+
+type wethFlow struct {
+	Addr   string
+	Amount *big.Int
+	IsSent bool // true=Deposit (sent ETH), false=Withdrawal (received ETH)
+}
 
 func (m *matcher) processEthBlock(ctx context.Context, ref models.EthBlockRef) {
 	if m.cfg.EthRPC == "" || ref.Hash == "" {
@@ -327,6 +337,7 @@ func (m *matcher) processEthBlock(ctx context.Context, ref models.EthBlockRef) {
 		receipt := ethReceipt{}
 		_ = m.ethRPCCall(ctx, "eth_getTransactionReceipt", []any{tx.Hash}, &receipt)
 		tokenTransfers := m.extractERC20Transfers(ctx, receipt.Logs)
+		wethFlows := extractWethFlows(receipt.Logs)
 
 		involved := map[string]struct{}{}
 		if from != "" && m.store.IsWatched(ctx, from) {
@@ -343,6 +354,11 @@ func (m *matcher) processEthBlock(ctx context.Context, ref models.EthBlockRef) {
 				involved[tr.To] = struct{}{}
 			}
 		}
+		for _, wf := range wethFlows {
+			if wf.Addr != "" && m.store.IsWatched(ctx, wf.Addr) {
+				involved[wf.Addr] = struct{}{}
+			}
+		}
 		if len(involved) == 0 {
 			continue
 		}
@@ -355,16 +371,26 @@ func (m *matcher) processEthBlock(ctx context.Context, ref models.EthBlockRef) {
 		gasWei := hexToBigInt(gasWeiHex)
 		success := receipt.Status == "" || receipt.Status == "0x1"
 		explorerURL := strings.TrimRight(m.cfg.EthExplorerURL, "/") + "/tx/" + tx.Hash
-		isContract := tx.Input != "0x" || len(tokenTransfers) > 0
+		isContract := tx.Input != "0x" || len(tokenTransfers) > 0 || len(wethFlows) > 0
 
 		for addr := range involved {
 			ethSentWei := big.NewInt(0)
 			ethReceivedWei := big.NewInt(0)
 			if addr == from {
-				ethSentWei = hexToBigInt(tx.Value)
+				ethSentWei = new(big.Int).Set(hexToBigInt(tx.Value))
 			}
 			if addr == to {
-				ethReceivedWei = hexToBigInt(tx.Value)
+				ethReceivedWei = new(big.Int).Set(hexToBigInt(tx.Value))
+			}
+			for _, wf := range wethFlows {
+				if wf.Addr != addr {
+					continue
+				}
+				if wf.IsSent {
+					ethSentWei = new(big.Int).Add(ethSentWei, wf.Amount)
+				} else {
+					ethReceivedWei = new(big.Int).Add(ethReceivedWei, wf.Amount)
+				}
 			}
 
 			sentTokens := map[string]erc20Transfer{}
@@ -469,6 +495,32 @@ func (m *matcher) extractERC20Transfers(ctx context.Context, logs []ethLog) []er
 			Symbol:    meta.Symbol,
 			Decimals:  meta.Decimals,
 		})
+	}
+	return out
+}
+
+func extractWethFlows(logs []ethLog) []wethFlow {
+	out := make([]wethFlow, 0)
+	for _, lg := range logs {
+		if len(lg.Topics) < 2 {
+			continue
+		}
+		amount := hexToBigInt(lg.Data)
+		if amount.Sign() == 0 {
+			continue
+		}
+		addr := topicToAddress(lg.Topics[1])
+		if addr == "" {
+			continue
+		}
+		switch strings.ToLower(lg.Topics[0]) {
+		case wethDepositTopic:
+			// Deposit(dst, wad): dst sent wad wei of ETH to WETH contract
+			out = append(out, wethFlow{Addr: addr, Amount: amount, IsSent: true})
+		case wethWithdrawalTopic:
+			// Withdrawal(src, wad): src received wad wei of ETH from WETH contract
+			out = append(out, wethFlow{Addr: addr, Amount: amount, IsSent: false})
+		}
 	}
 	return out
 }
