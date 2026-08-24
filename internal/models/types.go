@@ -53,6 +53,29 @@ type WsBlockNotify struct {
 	Jsonrpc string      `json:"jsonrpc"`
 }
 
+// WsSubscribeRequest is the JSON-RPC request sent after connecting to
+// subscribe to block notifications.
+type WsSubscribeRequest struct {
+	Jsonrpc string   `json:"jsonrpc"`
+	ID      int      `json:"id"`
+	Method  string   `json:"method"`
+	Params  []string `json:"params"`
+}
+
+// WsSubscription is a block notification in the fullnode's subscription
+// format: the block is nested under params.result.block.
+type WsSubscription struct {
+	Method string `json:"method"`
+	Params struct {
+		Subscription string `json:"subscription"`
+		Result       struct {
+			Block  BlockParams `json:"block"`
+			Events []any       `json:"events"`
+		} `json:"result"`
+	} `json:"params"`
+	Jsonrpc string `json:"jsonrpc"`
+}
+
 type BlockParams struct {
 	Hash         string    `json:"hash"`
 	Timestamp    int64     `json:"timestamp"`

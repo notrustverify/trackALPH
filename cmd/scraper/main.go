@@ -239,6 +239,11 @@ func wsLoop(ctx context.Context, cfg config.Config, str *stream.Client) {
 	}
 }
 
+const (
+	wsReadTimeout  = 60 * time.Second
+	wsPingInterval = 20 * time.Second
+)
+
 func connectAndListen(ctx context.Context, cfg config.Config, str *stream.Client) error {
 	u := url.URL{Scheme: "wss", Host: cfg.FullnodeWS, Path: "/events"}
 	log.Printf("Connecting to WebSocket: %s", u.String())
@@ -251,17 +256,34 @@ func connectAndListen(ctx context.Context, cfg config.Config, str *stream.Client
 	scraperWSConnected.Set(1)
 	defer scraperWSConnected.Set(0)
 
-	log.Println("WebSocket connected")
+	subReq := models.WsSubscribeRequest{
+		Jsonrpc: "2.0",
+		ID:      1,
+		Method:  "subscribe",
+		Params:  []string{"block"},
+	}
+	if err := conn.WriteJSON(subReq); err != nil {
+		return fmt.Errorf("subscribe block: %w", err)
+	}
+
+	log.Println("WebSocket connected and subscribed to block notifications")
+
+	conn.SetPongHandler(func(string) error {
+		conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
+		return nil
+	})
+	conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
 
 	go func() {
-		ticker := time.NewTicker(10 * time.Second)
+		ticker := time.NewTicker(wsPingInterval)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				if err := conn.WriteMessage(websocket.TextMessage, []byte("ping")); err != nil {
+				if err := conn.WriteControl(websocket.PingMessage, []byte{},
+					time.Now().Add(5*time.Second)); err != nil {
 					return
 				}
 			}
@@ -283,18 +305,30 @@ func connectAndListen(ctx context.Context, cfg config.Config, str *stream.Client
 			}
 			return fmt.Errorf("read: %w", err)
 		}
+		conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
 
-		var block models.WsBlockNotify
-		if err := json.Unmarshal(msg, &block); err != nil {
+		var sub models.WsSubscription
+		if err := json.Unmarshal(msg, &sub); err != nil {
 			continue
 		}
 
-		if block.Method != "block_notify" {
+		if sub.Method != "subscription" || sub.Params.Result.Block.Hash == "" {
 			continue
 		}
 		scraperBlocksReceivedTotal.Inc()
 
-		if err := str.Publish(ctx, stream.BlocksStream, msg); err != nil {
+		// Normalize to the internal envelope the matcher consumes.
+		block := models.WsBlockNotify{
+			Method:  "block_notify",
+			Params:  sub.Params.Result.Block,
+			Jsonrpc: sub.Jsonrpc,
+		}
+		data, err := json.Marshal(block)
+		if err != nil {
+			continue
+		}
+
+		if err := str.Publish(ctx, stream.BlocksStream, data); err != nil {
 			scraperPublishErrorsTotal.Inc()
 			if ctx.Err() != nil {
 				return ctx.Err()
